@@ -29,6 +29,8 @@ static BRIEF: &str = "Usage: ptx [OPTION]... [INPUT]...   (without -G) or: \
                  With no FILE, or when FILE is -, read standard input. \
                 Default is '-F /'.";
 
+static CHARSET_SIZE: u8 = u8::MAX;
+
 #[derive(Debug)]
 enum OutFormat {
     Dumb,
@@ -90,61 +92,62 @@ fn read_word_filter_file(
 struct WordFilter {
     only_specified: bool,
     ignore_specified: bool,
+    word_regex_specified: bool,
     only_set: HashSet<String>,
     ignore_set: HashSet<String>,
     word_regex: String,
+    word_break_chars: HashSet<char>,
 }
 
 impl WordFilter {
     fn new(matches: &clap::ArgMatches, config: &Config) -> UResult<Self> {
-        let (o, oset): (bool, HashSet<String>) = if matches.is_present(options::ONLY_FILE) {
-            let words =
-                read_word_filter_file(matches, options::ONLY_FILE).map_err_context(String::new)?;
-            (true, words)
-        } else {
-            (false, HashSet::new())
-        };
-        let (i, iset): (bool, HashSet<String>) = if matches.is_present(options::IGNORE_FILE) {
-            let words = read_word_filter_file(matches, options::IGNORE_FILE)
-                .map_err_context(String::new)?;
-            (true, words)
-        } else {
-            (false, HashSet::new())
-        };
+        let (only_specified, only_set): (bool, HashSet<String>) =
+            if matches.is_present(options::ONLY_FILE) {
+                let words = read_word_filter_file(matches, options::ONLY_FILE)
+                    .map_err_context(String::new)?;
+                (true, words)
+            } else {
+                (false, HashSet::new())
+            };
+        let (ignore_specified, ignore_set): (bool, HashSet<String>) =
+            if matches.is_present(options::IGNORE_FILE) {
+                let words = read_word_filter_file(matches, options::IGNORE_FILE)
+                    .map_err_context(String::new)?;
+                (true, words)
+            } else {
+                (false, HashSet::new())
+            };
         if matches.is_present(options::BREAK_FILE) {
             return Err(PtxError::NotImplemented("-b").into());
         }
-        // Ignore empty string regex from cmd-line-args
-        let arg_reg: Option<String> = if matches.is_present(options::WORD_REGEXP) {
-            match matches.value_of(options::WORD_REGEXP) {
-                Some(v) => {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.to_string())
-                    }
+
+        let (word_regex_specified, word_regex) = match matches.value_of(options::WORD_REGEXP) {
+            Some(v) => (true, v.to_string()),
+            None => (false, String::new()),
+        };
+
+        let mut word_break_chars = HashSet::new();
+
+        if config.gnu_ext {
+            for c in 0..CHARSET_SIZE {
+                let c = char::from(c);
+                if !c.is_alphanumeric() {
+                    word_break_chars.insert(c);
                 }
-                None => None,
             }
         } else {
-            None
-        };
-        let reg = match arg_reg {
-            Some(arg_reg) => arg_reg,
-            None => {
-                if config.gnu_ext {
-                    "\\w+".to_owned()
-                } else {
-                    "[^ \t\n]+".to_owned()
-                }
-            }
-        };
+            let sys_v_word_breaks = [' ', '\t', '\n'];
+            word_break_chars.extend(sys_v_word_breaks);
+        }
+
         Ok(Self {
-            only_specified: o,
-            ignore_specified: i,
-            only_set: oset,
-            ignore_set: iset,
-            word_regex: reg,
+            only_specified,
+            ignore_specified,
+            word_regex_specified,
+            only_set,
+            ignore_set,
+            word_regex,
+            word_break_chars,
         })
     }
 }
@@ -191,11 +194,22 @@ fn get_config(matches: &clap::ArgMatches) -> UResult<Config> {
     } else {
         return Err(PtxError::NotImplemented("GNU extensions").into());
     }
-    if matches.is_present(options::SENTENCE_REGEXP) {
-        return Err(PtxError::NotImplemented("-S").into());
-    }
-    config.auto_ref = matches.is_present(options::AUTO_REFERENCE);
+
     config.input_ref = matches.is_present(options::REFERENCES);
+
+    config.context_regex = match matches.value_of(options::SENTENCE_REGEXP) {
+        //TODO: make optional
+        Some(regexp) => regexp.to_owned(),
+        None => {
+            if config.gnu_ext && !config.input_ref {
+                "[.?!][]\"')}]*\\($\\|\t\\|  \\)[ \t\n]*".to_owned()
+            } else {
+                "\n".to_owned()
+            }
+        }
+    };
+
+    config.auto_ref = matches.is_present(options::AUTO_REFERENCE);
     config.right_ref &= matches.is_present(options::RIGHT_SIDE_REFS);
     config.ignore_case = matches.is_present(options::IGNORE_CASE);
     if matches.is_present(options::MACRO_NAME) {
@@ -282,6 +296,111 @@ fn read_input(input_files: &[String], config: &Config) -> std::io::Result<FileMa
 
 /// Go through every lines in the input files and record each match occurrence as a `WordRef`.
 fn create_word_set(config: &Config, filter: &WordFilter, file_map: &FileMap) -> BTreeSet<WordRef> {
+    if filter.word_regex_specified {
+        create_word_set_from_regexp(&config, &filter, &file_map)
+    } else {
+        create_word_set_from_word_breakers(&config, &filter, &file_map)
+    }
+}
+
+fn create_word_set_from_word_breakers(
+    config: &Config,
+    filter: &WordFilter,
+    file_map: &FileMap,
+) -> BTreeSet<WordRef> {
+    let mut word_set = BTreeSet::new();
+
+    for (file, lines) in file_map.iter() {
+        let mut line_count = 0;
+
+        for line_ix in 0..lines.lines.len() {
+            let line = &lines.lines[line_ix];
+            let chars_line = &lines.chars_lines[line_ix];
+            let offset = lines.offset;
+            let mut cursor: usize = 0;
+            let mut context_end = chars_line.len();
+
+            while cursor < context_end {
+                let mut line_scan: usize;
+                let context_start = cursor;
+
+                //SKIP_WHITE_BACKWARDS
+                while context_end > context_start && chars_line[context_end - 1].is_whitespace() {
+                    context_end -= 1;
+                }
+
+                loop {
+                    let word_start: usize;
+                    let word_end: usize;
+
+                    line_scan = cursor;
+
+                    while line_scan < context_end
+                        && filter.word_break_chars.contains(&chars_line[line_scan])
+                    {
+                        line_scan += 1;
+                    }
+
+                    if line_scan == context_end {
+                        break;
+                    }
+
+                    word_start = line_scan;
+
+                    while line_scan < context_end
+                        && !filter.word_break_chars.contains(&chars_line[line_scan])
+                    {
+                        line_scan += 1;
+                    }
+
+                    word_end = line_scan;
+
+                    cursor = word_start;
+
+                    if word_end == word_start {
+                        cursor += 1;
+                        continue;
+                    }
+
+                    let possible_start = cursor;
+                    let possible_end = word_end;
+                    let possible_size = word_end - word_start;
+                    cursor += possible_size;
+
+                    let word = line[possible_start..possible_end].to_string();
+
+                    if filter.only_specified && !(filter.only_set.contains(&word)) {
+                        continue;
+                    }
+                    if filter.ignore_specified && filter.ignore_set.contains(&word) {
+                        continue;
+                    }
+
+                    word_set.insert(WordRef {
+                        word,
+                        filename: file.clone(),
+                        global_line_nr: offset + line_count,
+                        local_line_nr: line_count,
+                        position: possible_start,
+                        position_end: possible_end,
+                    });
+                }
+
+                // if (possible_key.size > maximum_word_length)
+                // maximum_word_length = possible_key.size;
+            }
+            line_count += 1;
+        }
+    }
+
+    word_set
+}
+
+fn create_word_set_from_regexp(
+    config: &Config,
+    filter: &WordFilter,
+    file_map: &FileMap,
+) -> BTreeSet<WordRef> {
     let reg = Regex::new(&filter.word_regex).unwrap();
     let ref_reg = Regex::new(&config.context_regex).unwrap();
     let mut word_set: BTreeSet<WordRef> = BTreeSet::new();

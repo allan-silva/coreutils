@@ -10,7 +10,7 @@
 use clap::{crate_version, App, AppSettings, Arg};
 use regex::Regex;
 use std::cmp;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::default::Default;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -28,6 +28,8 @@ static BRIEF: &str = "Usage: ptx [OPTION]... [INPUT]...   (without -G) or: \
                  arguments to long options are mandatory for short options too.\n
                  With no FILE, or when FILE is -, read standard input. \
                 Default is '-F /'.";
+
+static CHARSET_SIZE: u8 = u8::MAX;
 
 #[derive(Debug)]
 enum OutFormat {
@@ -86,13 +88,23 @@ fn read_word_filter_file(
     Ok(words)
 }
 
+fn read_break_file(file_name: &str) -> UResult<HashSet<char>> {
+    let mut file = File::open(file_name)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes.iter().map(|b| char::from(*b)).collect())
+}
+
 #[derive(Debug)]
 struct WordFilter {
     only_specified: bool,
     ignore_specified: bool,
+    word_regex_specified: bool,
+    break_file_specified: bool,
     only_set: HashSet<String>,
     ignore_set: HashSet<String>,
     word_regex: String,
+    word_break_chars: HashSet<char>,
 }
 
 impl WordFilter {
@@ -111,40 +123,42 @@ impl WordFilter {
         } else {
             (false, HashSet::new())
         };
-        if matches.is_present(options::BREAK_FILE) {
-            return Err(PtxError::NotImplemented("-b").into());
-        }
-        // Ignore empty string regex from cmd-line-args
-        let arg_reg: Option<String> = if matches.is_present(options::WORD_REGEXP) {
-            match matches.value_of(options::WORD_REGEXP) {
-                Some(v) => {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.to_string())
+
+        let (word_regex_specified, word_regex) = match matches.value_of(options::WORD_REGEXP) {
+            Some(v) => (true, v.to_string()),
+            None => (false, String::new()),
+        };
+
+        let (break_file_specified, mut word_break_chars) =
+            match matches.value_of(options::BREAK_FILE) {
+                Some(break_file) => {
+                    let mut break_chars = read_break_file(break_file)?;
+                    if !config.gnu_ext {
+                        break_chars.extend([' ', '\t', '\n']);
                     }
+                    (true, break_chars)
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let reg = match arg_reg {
-            Some(arg_reg) => arg_reg,
-            None => {
-                if config.gnu_ext {
-                    "\\w+".to_owned()
-                } else {
-                    "[^ \t\n]+".to_owned()
+                None => (false, HashSet::new()),
+            };
+
+        if !break_file_specified && config.gnu_ext {
+            for c in 0..CHARSET_SIZE {
+                let c = char::from(c);
+                if !c.is_alphanumeric() {
+                    word_break_chars.insert(c);
                 }
             }
         };
+
         Ok(Self {
             only_specified: o,
             ignore_specified: i,
+            word_regex_specified: word_regex_specified,
+            break_file_specified: break_file_specified,
             only_set: oset,
             ignore_set: iset,
-            word_regex: reg,
+            word_regex: word_regex,
+            word_break_chars: word_break_chars,
         })
     }
 }
